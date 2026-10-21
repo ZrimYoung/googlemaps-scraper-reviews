@@ -26,7 +26,7 @@
 
 #### 主要特性
 
-- **完整数据提取**：商户基本信息、评论内容、评分、坐标等
+- **数据提取与完整性标记**：商户基本信息、评论内容、评分、坐标等
 - **智能重试机制**：网络超时和临时错误自动重试
 - **多种输出格式**：JSON和CSV格式同时输出
 - **错误分类处理**：详细的错误代码和错误信息
@@ -37,27 +37,28 @@
 1. **商户信息提取**
    ```python
    business_info = {
-       "name": "商户名称",
-       "address": "详细地址", 
-       "phone": "联系电话",
-       "website": "官方网站",
-       "rating": 4.5,
-       "total_reviews": 1250,
-       "coordinates": {"latitude": 40.7128, "longitude": -74.0060},
-       "hours": "营业时间信息"
+       "url": "https://maps.google.com/?cid=123&hl=en",
+       "name": "Shop",
+       "rating": "4.5 stars",
+       "category": "Restaurant",
+       "lat": "40.7128",
+       "lon": "-74.0060"
    }
    ```
 
 2. **评论数据提取**
    ```python
    review = {
-       "author": "用户名",
-       "rating": 5,
-       "date": "2024-01-15", 
-       "text": "评论内容",
-       "helpful_count": 12
+       "review_id": "review-id",
+       "user": "Alice",
+       "user_info": "",
+       "rating": "5 stars",
+       "time": "a month ago",
+       "content": "Review content"
    }
    ```
+
+地址、电话、网站、营业时间和点赞数尚未实现。完整字段、输出差异和 `reviews_complete` 定义见 [README](README.md#数据范围与完整性)。
 
 #### 使用方法
 
@@ -81,7 +82,9 @@ python main.py "URL" \
 | `--output-dir` | string | "output" | 输出目录路径 |
 | `--max-retries` | int | 3 | 最大重试次数 |
 | `--no-headless` | flag | False | 显示浏览器界面 |
-| `--json-output` | flag | False | 仅输出JSON格式 |
+| `--json-output` | flag | False | 标准输出为 JSON 数组，仍保存 CSV |
+| `--max-scrolls` | int | 30 | 评论滚动次数上限 |
+| `--scroll-wait` | float | 3 | 每次滚动等待新评论的秒数 |
 
 #### 错误处理
 
@@ -95,6 +98,7 @@ python main.py "URL" \
 - `1006`: 评论提取失败
 - `1007`: 坐标提取失败
 - `1008`: CSV保存失败
+- `1011`: 评论数量不完整或无法核实；保留部分结果，批量记为失败
 
 ---
 
@@ -200,8 +204,7 @@ python batch_scraper.py input/places.jsonl \
 batch_output/
 ├── parent_type/
 │   └── sub_type/
-│       ├── place_id_商户名称.json
-│       └── place_id_商户名称.csv
+│       └── place_id_商户名称.json
 ├── progress.json          # 处理进度
 ├── errors.jsonl          # 错误日志
 └── success.jsonl         # 成功日志
@@ -213,38 +216,13 @@ batch_output/
 
 ### process_urls.py - URL预处理器
 
-**功能描述**：批量为输入文件中的Google Maps URL添加`&hl=en`参数，以强制浏览器使用英文界面。这是确保爬虫能正确解析页面的关键预处理步骤。
+**功能描述**：可选的 URL 预处理工具。支持 `Maps_url` 和 `url`，使用 URL 解析器替换 `hl` 参数，避免重复语言参数、缺少 `?` 或 fragment 后拼接错误。单点和批量入口也会自动执行同样的规范化。
 
-#### 主要特性
-- **强制英文**：确保所有URL都指向英文版Google Maps页面。
-- **幂等性**：不会重复为已经包含`&hl=en`的URL添加参数。
-- **容错性**：会跳过文件中格式错误的JSON行。
-
-#### 使用方法
-1.  **配置路径**：在 `process_urls.py` 脚本中，修改 `input_file` 和 `output_file` 变量以匹配你的文件路径。
-2.  **执行脚本**：
-    ```bash
-    python process_urls.py
-    ```
-3.  **使用输出**：使用脚本生成的新文件（例如 `..._en.jsonl`）作为 `batch_scraper.py` 的输入。
-
-#### 核心逻辑
-```python
-def process_urls():
-    with open(input_file, 'r', encoding='utf-8') as infile, \
-         open(output_file, 'w', encoding='utf-8') as outfile:
-        for line in infile:
-            try:
-                data = json.loads(line)
-                # In the actual script, the key is 'Maps_url'. 
-                # This is a representative example.
-                if 'url' in data and data['url']:
-                    if '&hl=en' not in data['url']:
-                        data['url'] += '&hl=en'
-                outfile.write(json.dumps(data, ensure_ascii=False) + '\n')
-            except json.JSONDecodeError:
-                print(f"Skipping malformed JSON line: {line.strip()}")
+```bash
+python process_urls.py input/places.jsonl input/places_en.jsonl
 ```
+
+未指定参数时保留脚本中的默认路径。支持 UTF-8 BOM；非法 JSON、空链接和非对象行会跳过并报告行号。输出路径必须与输入路径不同。
 
 ### check_progress.py - 进度检查器
 
@@ -505,6 +483,7 @@ park: 987
 
 3. **文件操作错误 (1200-1299)**
    - `1008`: CSV保存失败
+- `1011`: 评论数量不完整或无法核实；保留部分结果，批量记为失败
 
 4. **网络相关错误 (1300-1399)**
    - `1009`: 网络超时
@@ -609,7 +588,7 @@ This document provides a detailed introduction to the functionality, usage, and 
 
 #### Key Features
 
-- **Comprehensive Data Extraction**: Business info, review content, ratings, coordinates, etc.
+- **Data Extraction and Completeness Tracking**: Business info, review content, ratings, coordinates, etc.
 - **Intelligent Retry Mechanism**: Automatic retries for network timeouts and temporary errors.
 - **Multiple Output Formats**: Simultaneous output in JSON and CSV formats.
 - **Categorized Error Handling**: Detailed error codes and messages.
@@ -620,27 +599,28 @@ This document provides a detailed introduction to the functionality, usage, and 
 1. **Business Information Extraction**
    ```python
    business_info = {
-       "name": "Business Name",
-       "address": "Detailed Address",
-       "phone": "Contact Phone",
-       "website": "Official Website",
-       "rating": 4.5,
-       "total_reviews": 1250,
-       "coordinates": {"latitude": 40.7128, "longitude": -74.0060},
-       "hours": "Business Hours Information"
+       "url": "https://maps.google.com/?cid=123&hl=en",
+       "name": "Shop",
+       "rating": "4.5 stars",
+       "category": "Restaurant",
+       "lat": "40.7128",
+       "lon": "-74.0060"
    }
    ```
 
 2. **Review Data Extraction**
    ```python
    review = {
-       "author": "Username",
-       "rating": 5,
-       "date": "2024-01-15",
-       "text": "Review content",
-       "helpful_count": 12
+       "review_id": "review-id",
+       "user": "Alice",
+       "user_info": "",
+       "rating": "5 stars",
+       "time": "a month ago",
+       "content": "Review content"
    }
    ```
+
+Address, phone, website, hours, and helpful counts are not implemented. See [README](README.md#data-scope-and-completeness) for the actual output and completeness contract.
 
 #### Usage
 
@@ -664,7 +644,9 @@ python main.py "URL" \
 | `--output-dir` | string | "output" | Output directory path |
 | `--max-retries` | int | 3 | Maximum number of retries |
 | `--no-headless` | flag | False | Show browser UI |
-| `--json-output` | flag | False | Output only in JSON format |
+| `--json-output` | flag | False | JSON array on stdout; CSV is still saved |
+| `--max-scrolls` | int | 30 | Review scroll limit |
+| `--scroll-wait` | float | 3 | Seconds to wait per scroll |
 
 #### Error Handling
 
@@ -678,6 +660,7 @@ The script uses a standardized error code system:
 - `1006`: Review extraction failed
 - `1007`: Coordinate extraction failed
 - `1008`: CSV save failed
+- `1011`: Incomplete or unverifiable review count; preserve partial data and mark batch failure
 
 ---
 
@@ -783,8 +766,7 @@ python batch_scraper.py input/places.jsonl \
 batch_output/
 ├── parent_type/
 │   └── sub_type/
-│       ├── place_id_BusinessName.json
-│       └── place_id_BusinessName.csv
+│       └── place_id_BusinessName.json
 ├── progress.json          # Processing progress
 ├── errors.jsonl          # Error log
 └── success.jsonl         # Success log
@@ -796,38 +778,13 @@ batch_output/
 
 ### process_urls.py - URL Pre-processor
 
-**Functional Description**: Batch processes input files to add the `&hl=en` parameter to Google Maps URLs, forcing the browser to use the English interface. This is a critical pre-processing step to ensure the scraper can parse pages correctly.
+**Functional Description**: Optional preprocessing for `Maps_url` and `url`. A URL parser replaces `hl` safely, preserving query parameters and fragments. Single-place and batch entry points also normalize URLs automatically.
 
-#### Key Features
-- **Force English**: Ensures all URLs point to the English version of Google Maps.
-- **Idempotent**: Does not repeatedly add the parameter to URLs that already contain `&hl=en`.
-- **Fault-Tolerant**: Skips malformed JSON lines in the file.
-
-#### Usage
-1.  **Configure Paths**: In the `process_urls.py` script, modify the `input_file` and `output_file` variables to match your file paths.
-2.  **Execute Script**:
-    ```bash
-    python process_urls.py
-    ```
-3.  **Use Output**: Use the new file generated by the script (e.g., `..._en.jsonl`) as input for `batch_scraper.py`.
-
-#### Core Logic
-```python
-def process_urls():
-    with open(input_file, 'r', encoding='utf-8') as infile, \
-         open(output_file, 'w', encoding='utf-8') as outfile:
-        for line in infile:
-            try:
-                data = json.loads(line)
-                # In the actual script, the key is 'Maps_url'. 
-                # This is a representative example.
-                if 'url' in data and data['url']:
-                    if '&hl=en' not in data['url']:
-                        data['url'] += '&hl=en'
-                outfile.write(json.dumps(data, ensure_ascii=False) + '\n')
-            except json.JSONDecodeError:
-                print(f"Skipping malformed JSON line: {line.strip()}")
+```bash
+python process_urls.py input/places.jsonl input/places_en.jsonl
 ```
+
+Omitted arguments use the script's default paths. UTF-8 BOM is supported. Invalid JSON, empty URLs, and non-object rows are skipped with a line-number message. Input and output must be different files.
 
 ### check_progress.py - Progress Checker
 
@@ -1082,6 +1039,7 @@ Invalid URL format: 3
 
 3. **File Operation Errors (1200-1299)**
    - `1008`: CSV save failed
+- `1011`: Incomplete or unverifiable review count; preserve partial data and mark batch failure
 
 4. **Network-related Errors (1300-1399)**
    - `1009`: Network timeout

@@ -12,7 +12,7 @@
 - **错误重试机制**：智能重试失败的地点，提高成功率
 - **详细进度跟踪**：实时显示处理进度和统计信息
 - **灵活输出格式**：支持JSON和CSV格式输出
-- **完整数据提取**：包括商户基本信息、评论内容、评分等
+- **数据提取与完整性标记**：包括商户基本信息、评论内容、评分等
 
 ## 📚 文档导航
 
@@ -53,19 +53,19 @@ googlemaps-scraper-reviews/
 
 ### 环境要求
 
-- Python 3.7+
+- Python 3.9+
 - Chrome浏览器
 - ChromeDriver（会自动管理）
 
 ### 安装依赖
 
 ```bash
-pip install selenium pandas tqdm
+pip install -r requirements.txt
 ```
 
 ### 准备输入数据
 
-在 `input/` 目录下放置JSONL格式的输入文件，每行包含一个地点的信息：
+在 `input/` 目录下放置 JSONL 文件，每行包含一个地点对象。必需字段为 `place_id`、`parent_type`、`sub_type` 和 `Maps_url`（兼容别名 `url`）：
 
 ```json
 {
@@ -73,24 +73,21 @@ pip install selenium pandas tqdm
     "place_name": "商户名称",
     "parent_type": "food_and_drink",
     "sub_type": "restaurant",
-    "url": "https://maps.google.com/..."
+    "Maps_url": "https://maps.google.com/..."
 }
 ```
 
 ### URL预处理：强制英文界面
 
-**重要提示：** 当前版本的爬虫仅能识别和解析Google Maps的 **英文页面** 结构。为确保数据能被正确抓取，所有URL都必须经过预处理以强制页面以英文显示。未经处理的URL将导致爬取失败。
+爬虫仍依赖英文页面选择器。单点入口和批量输入读取器会自动设置 `hl=en`，替换已有语言参数并保留其他参数及 fragment，因此预处理现在是可选步骤。
 
-项目中的 `process_urls.py` 脚本可用于批量为URL添加 `&hl=en` 参数。
+需要另存英文链接文件时，可以运行：
 
-**使用步骤：**
+```bash
+python process_urls.py input/places.jsonl input/places_en.jsonl
+```
 
-1.  **配置脚本**：打开 `process_urls.py` 文件，根据您的文件位置修改 `input_file` 和 `output_file` 变量。
-2.  **运行脚本**：
-    ```bash
-    python process_urls.py
-    ```
-3.  **使用新文件**：脚本会生成一个处理后的新文件。请务必使用这个新生成的文件（例如 `..._en.jsonl`）作为后续爬取操作的输入。
+脚本同时支持 `Maps_url` 和 `url`。请优先使用完整地点链接；短链接重定向后的语言仍需现场验证。
 
 ### 单点爬取
 
@@ -102,9 +99,13 @@ python main.py "https://maps.google.com/..."
 
 支持的参数：
 - `--output-dir`：输出目录（默认：output）
-- `--no-headless`：显示浏览器界面
-- `--json-output`：仅输出JSON格式
-- `--max-retries`：最大重试次数（默认：3）
+- `--url`：也可通过该参数传入单个 URL
+- `--headless`：无界面模式；单点命令默认显示浏览器
+- `--no-headless`：显式显示浏览器界面
+- `--json-output`：标准输出为 JSON 数组，日志写入标准错误；仍会保存 CSV
+- `--max-retries`：最多尝试次数，含第一次（默认：3）
+- `--max-scrolls`：滚动次数上限（默认：30），也支持批量入口
+- `--scroll-wait`：每次滚动等待新评论的秒数（默认：3），也支持批量入口
 
 ### 批量爬取
 
@@ -185,44 +186,67 @@ python input_statistics.py input/places.jsonl
 
 ### JSON格式
 
-每个商户的数据保存为独立的JSON文件：
+批量入口为每个地点保存独立 JSON，以下为字段示例。单点入口仅在 `--json-output` 时将结果数组写到标准输出，状态字段为 `success` / `error_code` / `error_message`，不自动保存 JSON 文件。
 
 ```json
 {
-    "place_id": "ChIJ...",
-    "business_info": {
-        "name": "商户名称",
-        "address": "详细地址",
-        "phone": "联系电话",
-        "website": "官方网站",
-        "rating": 4.5,
-        "total_reviews": 1250,
-        "coordinates": {
-            "latitude": 40.7128,
-            "longitude": -74.0060
-        },
-        "hours": "营业时间信息"
-    },
-    "reviews": [
-        {
-            "author": "用户名",
-            "rating": 5,
-            "date": "2024-01-15",
-            "text": "评论内容",
-            "helpful_count": 12
-        }
-    ],
-    "scrape_info": {
-        "scraped_at": "2024-01-15T10:30:00",
-        "total_reviews_scraped": 45,
-        "scrape_duration": 120.5
+  "place_id": "ChIJ...",
+  "Maps_url": "https://maps.google.com/?cid=123&hl=en",
+  "parent_type": "food_and_drink",
+  "sub_type": "restaurant",
+  "scrape_success": true,
+  "scrape_error_code": 0,
+  "scrape_error_message": "",
+  "business_info": {
+    "url": "https://maps.google.com/?cid=123&hl=en",
+    "name": "商户名称",
+    "rating": "4.5 stars",
+    "category": "Restaurant",
+    "lat": "40.7128",
+    "lon": "-74.0060"
+  },
+  "reviews_count": 1,
+  "expected_review_count": 1,
+  "reviews_complete": true,
+  "review_stop_reason": "expected_count_reached",
+  "reviews": [
+    {
+      "review_id": "review-id",
+      "user": "用户名",
+      "user_info": "",
+      "rating": "5 stars",
+      "time": "a month ago",
+      "content": "评论内容"
     }
+  ],
+  "scraped_at": "2026-10-22 10:30:00",
+  "retry_attempt": 0,
+  "has_reviews": true,
+  "review_status": "有评论",
+  "final_success": true
 }
 ```
 
 ### CSV格式
 
-同时生成CSV格式的评论数据，便于进一步分析。
+单点入口保存 CSV，`rating` 是评论评分，`business_rating` 是商户总评分；两者均保留页面文本。批量入口保存 JSON 后会清理中间 CSV，不保留每商户 CSV。
+
+### 数据范围与完整性
+
+- 当前不提取地址、电话、网站、营业时间或点赞数；时间保留页面相对时间文本，不转换为绝对日期。坐标是从 URL 提取的字符串，缺失时为空。
+- 每次滚动都采集当前评论，并优先用 `review_id` 去重；纯星级评价的 `content` 为空字符串。
+- `reviews_complete=true` 只表示评论数量达到页面显示的总数，或页面明确显示零评论。它不保证隐藏或折叠的文字已完整展开，也不代表 Google 后端全部评论。
+- 未找到评论按钮是错误 `1004`；缺失总数不等于零。达到滚动上限、加载停滞或无法验证数量时返回 `1011`，保存部分数据，批量结果进入失败列表。
+- `1011` 不会在单点入口立即重复相同采集。可以增加 `--max-scrolls` / `--scroll-wait` 后使用批量 `--retry-failed`；同时保证 `--timeout` 足够长。
+- 重试扫描器能识别旧文件中带错误码的“成功”记录；旧版未标注完整性的历史数据不能据此推定完整。
+
+### 离线测试
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+测试使用模拟浏览器页面，不代表已验证 Google Maps 当前页面兼容性。
 
 ## 🛠️ 故障排除
 
@@ -316,7 +340,7 @@ A powerful tool for scraping business information and user reviews from Google M
 - **Error Retry Mechanism**: Intelligently retries failed places to increase success rate.
 - **Detailed Progress Tracking**: Real-time display of processing progress and statistics.
 - **Flexible Output Formats**: Supports JSON and CSV output formats.
-- **Comprehensive Data Extraction**: Includes basic business information, review content, ratings, etc.
+- **Data Extraction and Completeness Tracking**: Includes basic business information, review content, ratings, etc.
 
 ## 📚 Documentation
 
@@ -357,19 +381,19 @@ googlemaps-scraper-reviews/
 
 ### Requirements
 
-- Python 3.7+
+- Python 3.9+
 - Google Chrome Browser
 - ChromeDriver (managed automatically)
 
 ### Installation
 
 ```bash
-pip install selenium pandas tqdm
+pip install -r requirements.txt
 ```
 
 ### Prepare Input Data
 
-Place JSONL format input files in the `input/` directory. Each line should contain information for one place:
+Place JSONL files in `input/`, with one place object per line. Required fields are `place_id`, `parent_type`, `sub_type`, and `Maps_url` (the alias `url` is also accepted):
 
 ```json
 {
@@ -377,24 +401,21 @@ Place JSONL format input files in the `input/` directory. Each line should conta
     "place_name": "Business Name",
     "parent_type": "food_and_drink",
     "sub_type": "restaurant",
-    "url": "https://maps.google.com/..."
+    "Maps_url": "https://maps.google.com/..."
 }
 ```
 
 ### URL Pre-processing: Force English Interface
 
-**IMPORTANT:** The current version of the scraper can only recognize and parse the structure of **English Google Maps pages**. To ensure data is scraped correctly, all URLs must be pre-processed to force the page to display in English. Unprocessed URLs will lead to scraping failures.
+The scraper still uses English page selectors. Both single-place scraping and the batch loader set `hl=en` automatically, replacing existing language parameters while preserving other query parameters and fragments. Pre-processing is optional.
 
-The `process_urls.py` script in the project can be used to add the `&hl=en` parameter to URLs in bulk.
+To save a separate normalized input file:
 
-**Steps:**
+```bash
+python process_urls.py input/places.jsonl input/places_en.jsonl
+```
 
-1.  **Configure the script**: Open the `process_urls.py` file and modify the `input_file` and `output_file` variables according to your file locations.
-2.  **Run the script**:
-    ```bash
-    python process_urls.py
-    ```
-3.  **Use the new file**: The script will generate a new processed file. Be sure to use this new file (e.g., `..._en.jsonl`) as the input for subsequent scraping operations.
+Both `Maps_url` and `url` are supported. Prefer full place URLs; language behavior after a short-link redirect still needs live verification.
 
 ### Single Place Scraping
 
@@ -406,9 +427,13 @@ python main.py "https://maps.google.com/..."
 
 Supported arguments:
 - `--output-dir`: Output directory (default: output)
-- `--no-headless`: Show browser UI
-- `--json-output`: Output only in JSON format
-- `--max-retries`: Maximum number of retries (default: 3)
+- `--url`: Alternative to the positional single URL
+- `--headless`: Run without browser UI; the single-place CLI shows the browser by default
+- `--no-headless`: Explicitly show browser UI
+- `--json-output`: Write a JSON array to stdout and logs to stderr; CSV is still saved
+- `--max-retries`: Maximum attempts including the first (default: 3)
+- `--max-scrolls`: Scroll limit (default: 30); also available in the batch CLI
+- `--scroll-wait`: Seconds to wait for new reviews per scroll (default: 3); also available in the batch CLI
 
 ### Batch Scraping
 
@@ -489,44 +514,67 @@ python input_statistics.py input/places.jsonl
 
 ### JSON Format
 
-Data for each business is saved in a separate JSON file:
+The batch CLI saves one JSON file per place; an example follows. The single-place CLI writes a result array to stdout with `--json-output`, using `success` / `error_code` / `error_message`; it does not automatically save JSON files.
 
 ```json
 {
-    "place_id": "ChIJ...",
-    "business_info": {
-        "name": "Business Name",
-        "address": "Detailed Address",
-        "phone": "Contact Phone",
-        "website": "Official Website",
-        "rating": 4.5,
-        "total_reviews": 1250,
-        "coordinates": {
-            "latitude": 40.7128,
-            "longitude": -74.0060
-        },
-        "hours": "Business Hours Information"
-    },
-    "reviews": [
-        {
-            "author": "Username",
-            "rating": 5,
-            "date": "2024-01-15",
-            "text": "Review content",
-            "helpful_count": 12
-        }
-    ],
-    "scrape_info": {
-        "scraped_at": "2024-01-15T10:30:00",
-        "total_reviews_scraped": 45,
-        "scrape_duration": 120.5
+  "place_id": "ChIJ...",
+  "Maps_url": "https://maps.google.com/?cid=123&hl=en",
+  "parent_type": "food_and_drink",
+  "sub_type": "restaurant",
+  "scrape_success": true,
+  "scrape_error_code": 0,
+  "scrape_error_message": "",
+  "business_info": {
+    "url": "https://maps.google.com/?cid=123&hl=en",
+    "name": "Business Name",
+    "rating": "4.5 stars",
+    "category": "Restaurant",
+    "lat": "40.7128",
+    "lon": "-74.0060"
+  },
+  "reviews_count": 1,
+  "expected_review_count": 1,
+  "reviews_complete": true,
+  "review_stop_reason": "expected_count_reached",
+  "reviews": [
+    {
+      "review_id": "review-id",
+      "user": "Username",
+      "user_info": "",
+      "rating": "5 stars",
+      "time": "a month ago",
+      "content": "Review content"
     }
+  ],
+  "scraped_at": "2026-10-22 10:30:00",
+  "retry_attempt": 0,
+  "has_reviews": true,
+  "review_status": "有评论",
+  "final_success": true
 }
 ```
 
 ### CSV Format
 
-CSV format review data is also generated for further analysis.
+The single-place CLI saves CSV: `rating` is the review rating and `business_rating` is the overall business rating. Both retain the page text. The batch CLI saves JSON and removes intermediate CSV files.
+
+### Data Scope and Completeness
+
+- Address, phone, website, opening hours, and helpful counts are not extracted. Review times retain relative page text, not normalized dates. Coordinates are URL-derived strings, empty when unavailable.
+- Reviews are collected on every scroll and deduplicated primarily by `review_id`. Ratings without text retain an empty `content` string.
+- `reviews_complete=true` only confirms the captured count reaches the displayed total, or the page explicitly reports zero reviews. It does not guarantee expanded text or coverage of all reviews held by Google.
+- A missing review button is error `1004`; an unknown total is not zero. A scroll limit, stalled loading, or unverifiable count returns `1011`, preserves partial data, and enters the batch failure list.
+- The single-place scraper does not immediately repeat an identical `1011` attempt. Increase `--max-scrolls` / `--scroll-wait` and use batch `--retry-failed`; allow a sufficient `--timeout`.
+- The retry scanner detects legacy “successful” records carrying error codes. Legacy records without completeness metadata cannot be assumed complete.
+
+### Offline Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Tests use simulated browser pages and do not verify compatibility with the current live Google Maps UI.
 
 ## 🛠️ Troubleshooting
 

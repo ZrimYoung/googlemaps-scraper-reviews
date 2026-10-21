@@ -146,6 +146,7 @@ from tqdm import tqdm
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from url_utils import english_maps_url
 
 # =============================================================================
 # 主要类定义
@@ -173,7 +174,7 @@ class BatchGoogleMapsScraper:
             self.config.update(config)
         
         # 核心路径设置
-        self.script_path = script_path or self.config['scraper_script']
+        self.script_path = script_path or str(Path(__file__).resolve().parent / self.config['scraper_script'])
         self.output_base_dir = Path(output_base_dir)
         
         # 状态文件路径
@@ -185,7 +186,7 @@ class BatchGoogleMapsScraper:
         self.lock = threading.Lock()
         
         # 创建输出目录
-        self.output_base_dir.mkdir(exist_ok=True)
+        self.output_base_dir.mkdir(parents=True, exist_ok=True)
         
         # 设置日志系统
         self.setup_logging()
@@ -233,7 +234,7 @@ class BatchGoogleMapsScraper:
         places = []
         try:
             # 🔥 改进编码处理，尝试多种编码方式
-            encodings_to_try = ['utf-8', 'utf-8-sig', 'gbk', 'gb2312']
+            encodings_to_try = ['utf-8-sig', 'utf-8', 'gbk', 'gb2312']
             file_content = None
             used_encoding = None
             
@@ -261,6 +262,9 @@ class BatchGoogleMapsScraper:
                     continue
                 try:
                     place_data = json.loads(line)
+                    if not isinstance(place_data, dict):
+                        raise ValueError('每行必须是 JSON 对象')
+                    place_data['Maps_url'] = english_maps_url(place_data.get('Maps_url') or place_data.get('url'))
                     # 验证必需字段
                     required_fields = ['place_id', 'Maps_url', 'parent_type', 'sub_type']
                     if all(field in place_data for field in required_fields):
@@ -268,7 +272,7 @@ class BatchGoogleMapsScraper:
                     else:
                         missing_fields = [f for f in required_fields if f not in place_data]
                         self.logger.warning(f"第{line_num}行缺少必需字段 {missing_fields}: {line[:100]}...")
-                except json.JSONDecodeError as e:
+                except (json.JSONDecodeError, ValueError) as e:
                     self.logger.error(f"第{line_num}行JSON解析失败: {e}")
         except FileNotFoundError:
             self.logger.error(f"输入文件不存在: {input_file}")
@@ -537,6 +541,9 @@ class BatchGoogleMapsScraper:
         # 添加其他参数
         if kwargs.get("max_retries"):
             cmd.extend(["--max-retries", str(kwargs["max_retries"])])
+        for option in ('max_scrolls', 'scroll_wait'):
+            if kwargs.get(option) is not None:
+                cmd.extend(['--' + option.replace('_', '-'), str(kwargs[option])])
         if kwargs.get("verbose") or self.config['verbose_logging']:
             cmd.append("--verbose")
         
@@ -627,42 +634,23 @@ class BatchGoogleMapsScraper:
                     "business_info": scrape_result.get("business_info", {}),
                     "reviews_count": scrape_result.get("reviews_count", 0),
                     "reviews": scrape_result.get("reviews", []),
+                    "expected_review_count": scrape_result.get("expected_review_count"),
+                    "reviews_complete": scrape_result.get("reviews_complete", False),
+                    "review_stop_reason": scrape_result.get("review_stop_reason", "unknown"),
                     "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "retry_attempt": kwargs.get("retry_attempt", 0)
                 }
                 
-                # 🆕 增强评论状态判断
-                if combined_result["scrape_success"]:
-                    reviews_count = combined_result["reviews_count"]
-                    error_code = combined_result["scrape_error_code"]
-                    
-                    if reviews_count > 0:
-                        # 有评论的情况 - 真正成功
-                        combined_result["has_reviews"] = True
-                        combined_result["review_status"] = "有评论"
-                        combined_result["final_success"] = True
-                    elif error_code == 1004:
-                        # 找不到Reviews按钮，说明商户没有评论功能（正常情况）- 算成功
-                        combined_result["has_reviews"] = False
-                        combined_result["review_status"] = "无评论功能"
-                        combined_result["final_success"] = True
-                    else:
-                        # 🔥 关键修改：改进无评论地点的判断逻辑
-                        if error_code == 0 and reviews_count == 0:
-                            # 成功抓取地点信息但没有评论，这可能是正常情况（地点确实没有评论）
-                            # 不应该无限重试，应该标记为成功
-                            combined_result["has_reviews"] = False
-                            combined_result["review_status"] = "暂无评论"
-                            combined_result["final_success"] = True  # 🔥 改为成功，避免无限重试
-                        else:
-                            combined_result["has_reviews"] = False
-                            combined_result["review_status"] = "评论抓取失败"
-                            combined_result["final_success"] = False  # 真正的失败才需要重试
-                else:
-                    # 抓取失败的情况
-                    combined_result["has_reviews"] = None
-                    combined_result["review_status"] = "抓取失败"
-                    combined_result["final_success"] = False
+                # Finding some reviews, or missing the tab, is not proof of success.
+                success = (combined_result["scrape_success"]
+                           and combined_result["scrape_error_code"] == 0
+                           and combined_result["reviews_complete"] is True)
+                combined_result["final_success"] = bool(success)
+                combined_result["has_reviews"] = combined_result["reviews_count"] > 0
+                combined_result["review_status"] = (
+                    ("有评论" if combined_result["has_reviews"] else "暂无评论")
+                    if success else ("评论不完整" if combined_result["has_reviews"] else "评论抓取失败")
+                )
                 
                 return combined_result
             else:
@@ -936,7 +924,17 @@ class BatchGoogleMapsScraper:
         progress = self.load_progress()
         
         # 过滤需要处理的地点
-        places_to_process, failed_place_ids = self.filter_places_to_process(places, retry_failed, max_places)
+        if resume:
+            places_to_process, failed_place_ids = self.filter_places_to_process(places, retry_failed, max_places)
+        else:
+            limit = max_places or self.config['max_places']
+            places_to_process = list(places[:limit] if limit else places)
+            failed_place_ids = set()
+            # Reset only this run's selected places; preserve other saved work.
+            selected_ids = {place['place_id'] for place in places_to_process}
+            for status in ('successful', 'failed', 'skipped'):
+                progress[status] = [place_id for place_id in progress.get(status, [])
+                                    if place_id not in selected_ids]
         
         if not places_to_process:
             self.logger.info("没有需要处理的地点")
@@ -1517,9 +1515,14 @@ def main():
     parser.add_argument('input_file', nargs='?', help='JSONL格式的输入文件')
     parser.add_argument('--output-dir', default='batch_output', help='输出目录')
     parser.add_argument('--max-workers', type=int, help='最大并发数')
-    parser.add_argument('--max-retries', type=int, default=3, help='最大重试次数')
-    parser.add_argument('--timeout', type=int, default=300, help='单个地点超时时间(秒)')
-    parser.add_argument('--no-resume', action='store_true', help='不从上次中断处继续')
+    parser.add_argument('--max-retries', type=int, help='最大重试次数')
+    parser.add_argument('--timeout', type=int, help='单个地点超时时间(秒)')
+    resume_mode = parser.add_mutually_exclusive_group()
+    resume_mode.add_argument('--resume', dest='resume', action='store_true', help='从上次中断处继续（默认）')
+    resume_mode.add_argument('--no-resume', dest='resume', action='store_false', help='不从上次中断处继续')
+    parser.set_defaults(resume=True)
+    parser.add_argument('--max-scrolls', type=int, default=30, help='每个地点的评论滚动次数上限')
+    parser.add_argument('--scroll-wait', type=float, default=3, help='每次滚动等待新评论的秒数')
     parser.add_argument('--retry-failed', action='store_true', help='重试失败的地点')
     parser.add_argument('--max-places', type=int, help='每次最大处理地点数量')
     parser.add_argument('--verbose', action='store_true', help='详细日志')
@@ -1527,43 +1530,41 @@ def main():
     parser.add_argument('--show-status', action='store_true', help='显示当前处理状态')
     
     # 🆕 无人值守模式参数
-    parser.add_argument('--unattended', action='store_true', help='无人值守模式（适合大规模数据长时间处理）')
-    parser.add_argument('--infinite', action='store_true', help='🔄 无限运行模式（持续运行直到手动停止）')
-    parser.add_argument('--fast', action='store_true', help='⚡ 快速模式（适合测试或小规模数据）')
-    parser.add_argument('--max-rounds', type=int, default=5, help='无人值守模式的最大处理轮数')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--test', action='store_true', help='测试配置：1 个并发，最多 5 个地点')
+    modes.add_argument('--production', action='store_true', help='生产配置')
+    modes.add_argument('--unattended', action='store_true', help='无人值守模式（适合大规模数据长时间处理）')
+    modes.add_argument('--infinite', action='store_true', help='🔄 无限运行模式（持续运行直到手动停止）')
+    modes.add_argument('--fast', action='store_true', help='⚡ 快速模式（适合测试或小规模数据）')
+    parser.add_argument('--max-rounds', type=int, help='无人值守模式的最大处理轮数')
     parser.add_argument('--rest-time', type=int, help='轮次间休息时间（秒）')
     parser.add_argument('--checkpoint-interval', type=int, help='检查点间隔时间（分钟）')
     
     args = parser.parse_args()
     
-    # 🔥 根据运行模式选择配置
-    config = None
-    if args.infinite:
-        # 无限运行模式
-        config = INFINITE_CONFIG.copy()
-        print("🔄 使用无限运行模式配置")
-    elif args.fast:
-        # 快速模式
-        config = FAST_CONFIG.copy()
-        print("⚡ 使用快速模式配置")
-    elif args.unattended:
-        # 传统无人值守模式
-        config = UNATTENDED_CONFIG.copy()
-        print("🔧 使用无人值守模式配置")
-    
-    # 应用命令行参数覆盖
-    if config:
-        if args.max_places:
-            config['max_places'] = args.max_places
-        if args.max_workers is not None:  # 🔥 只有明确指定时才覆盖
-            config['max_workers'] = args.max_workers
-        if args.max_rounds:
-            config['max_continuous_rounds'] = args.max_rounds
-        if args.rest_time:
-            config['rest_between_rounds'] = args.rest_time
-        if args.checkpoint_interval:
-            config['checkpoint_interval'] = args.checkpoint_interval
-    
+    config = DEFAULT_CONFIG.copy()
+    for enabled, preset in (
+        (args.test, TEST_CONFIG), (args.production, PRODUCTION_CONFIG),
+        (args.infinite, INFINITE_CONFIG), (args.fast, FAST_CONFIG),
+        (args.unattended, UNATTENDED_CONFIG),
+    ):
+        if enabled:
+            config.update(preset)
+    for key in ('max_places', 'max_workers', 'max_retries', 'timeout'):
+        value = getattr(args, key)
+        if value is not None:
+            if value < 1:
+                parser.error('--' + key.replace('_', '-') + ' 必须大于 0')
+            config[key] = value
+    for argument, key in (('max_rounds', 'max_continuous_rounds'),
+                          ('rest_time', 'rest_between_rounds'),
+                          ('checkpoint_interval', 'checkpoint_interval')):
+        value = getattr(args, argument)
+        if value is not None:
+            config[key] = value
+    if args.max_scrolls < 1 or args.scroll_wait <= 0:
+        parser.error('--max-scrolls 和 --scroll-wait 必须大于 0')
+
     scraper = BatchGoogleMapsScraper(output_base_dir=args.output_dir, config=config)
     
     if args.generate_report:
@@ -1601,22 +1602,26 @@ def main():
         
         scraper.unattended_processing(
             places,
-            max_retries=args.max_retries,
-            timeout=args.timeout,
+            max_retries=config["max_retries"],
+            timeout=config["timeout"],
+            max_scrolls=args.max_scrolls,
+            scroll_wait=args.scroll_wait,
             verbose=args.verbose
         )
     else:
         # 标准批量处理模式
         # 🔥 使用配置中的max_workers，如果用户没有指定的话
-        max_workers = args.max_workers if args.max_workers is not None else 3
+        max_workers = config["max_workers"]
         scraper.process_batch(
             places,
             max_workers=max_workers,
             retry_failed=args.retry_failed,
-            max_places=args.max_places,
-            resume=not args.no_resume,
-            max_retries=args.max_retries,
-            timeout=args.timeout,
+            max_places=config["max_places"],
+            resume=args.resume,
+            max_retries=config["max_retries"],
+            timeout=config["timeout"],
+            max_scrolls=args.max_scrolls,
+            scroll_wait=args.scroll_wait,
             verbose=args.verbose
         )
     
@@ -1624,4 +1629,4 @@ def main():
     scraper.generate_summary_report()
 
 if __name__ == "__main__":
-    main() 
+    main()

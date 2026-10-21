@@ -116,7 +116,11 @@ class FailedScrapeRetryProcessor:
                     data = json.load(f)
                 
                 # 检查是否为失败记录
-                if not data.get('scrape_success', True):  # scrape_success为False或不存在
+                if ('place_id' in data and (
+                    not data.get('final_success', data.get('scrape_success', False))
+                    or data.get('scrape_error_code', 0) != 0
+                    or data.get('reviews_complete') is False
+                )):
                     # 提取路径信息来确定parent_type和sub_type
                     relative_path = json_file.relative_to(self.output_dir)
                     path_parts = relative_path.parts
@@ -741,4 +745,4 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main() 
+    main()

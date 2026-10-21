@@ -12,6 +12,7 @@ import time
 import re
 import logging
 import argparse
+from url_utils import english_maps_url
 import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -46,6 +47,7 @@ class ErrorCodes:
     CSV_SAVE_FAILED = 1008
     NETWORK_TIMEOUT = 1009
     ELEMENT_NOT_FOUND = 1010
+    REVIEWS_INCOMPLETE = 1011
     UNEXPECTED_ERROR = 1999
 
 def setup_logging():
@@ -112,21 +114,107 @@ def safe_get_attribute(element, attr, default=""):
     except:
         return default
 
-def scrape_single_url(url, output_dir="output", headless=True, max_retries=3):
+def expected_review_count(driver):
+    """Read the English overview count; a missing count is unknown, never zero."""
+    counts = []
+    for element in driver.find_elements(By.CSS_SELECTOR, 'button[aria-label]'):
+        label = safe_get_attribute(element, 'aria-label')
+        match = re.search(r'\b([\d,]+)\s+reviews?\b', label, re.IGNORECASE)
+        if match:
+            counts.append(int(match.group(1).replace(',', '')))
+    if counts:
+        return max(counts)
+    empty = driver.find_elements(
+        By.XPATH, "//*[normalize-space(text())='No reviews' or normalize-space(text())='No reviews yet']"
+    )
+    return 0 if any(element.is_displayed() for element in empty) else None
+
+
+def extract_review(element):
+    """Text is optional: Google Maps also has ratings without written reviews."""
+    def optional_text(selector):
+        matches = element.find_elements(By.CSS_SELECTOR, selector)
+        return safe_get_text(matches[0]) if matches else ''
+
+    rating = safe_get_attribute(element.find_element(By.CSS_SELECTOR, 'span.kvMYJc'), 'aria-label')
+    if not rating:
+        raise ValueError('评论评分缺失')
+    return {
+        'review_id': safe_get_attribute(element, 'data-review-id'),
+        'user': safe_get_attribute(element, 'aria-label', '匿名用户'),
+        'user_info': optional_text('div.RfnDt'),
+        'rating': rating,
+        'time': optional_text('span.rsqaWe'),
+        'content': optional_text('span.wiI7pd'),
+    }
+
+
+def collect_reviews(driver, container, expected_count, max_scrolls=30, scroll_wait=3):
+    """Collect each loaded page before it disappears from a virtualized list.
+
+    Neither a fixed scroll height nor a timeout proves that all reviews loaded.
+    Only reaching the advertised count confirms count completeness.
+    """
+    collected = {}
+    failed = set()
+
+    def read_visible(browser):
+        before = len(collected)
+        for element in browser.find_elements(By.CSS_SELECTOR, 'div.jftiEf.fontBodyMedium'):
+            identity = safe_get_attribute(element, 'data-review-id')
+            failure_key = identity or safe_get_attribute(element, 'outerHTML', 'unknown')
+            try:
+                data = extract_review(element)
+                key = identity or json.dumps(data, sort_keys=True, ensure_ascii=False)
+                collected[key] = data
+                failed.discard(failure_key)
+            except (NoSuchElementException, WebDriverException, ValueError):
+                failed.add(failure_key)
+        return len(collected) > before
+
+    def outcome(complete, reason):
+        return list(collected.values()), complete, reason
+
+    def reached_count():
+        return expected_count is not None and len(collected) >= expected_count and not failed
+
+    try:
+        read_visible(driver)
+        if reached_count():
+            return outcome(True, 'expected_count_reached')
+        unchanged = 0
+        for _ in range(max_scrolls):
+            before = len(collected)
+            driver.execute_script('arguments[0].scrollTop = arguments[0].scrollHeight', container)
+            try:
+                WebDriverWait(driver, scroll_wait).until(read_visible)
+            except TimeoutException:
+                pass
+            if reached_count():
+                return outcome(True, 'expected_count_reached')
+            unchanged = unchanged + 1 if len(collected) == before else 0
+            if unchanged >= 3:
+                return outcome(False, 'extraction_failed' if failed else 'stalled')
+        return outcome(False, 'extraction_failed' if failed else 'max_scrolls')
+    except WebDriverException:
+        return outcome(False, 'scroll_failed')
+
+
+def scrape_single_url(url, output_dir="output", headless=True, max_retries=3,
+                      max_scrolls=30, scroll_wait=3):
     """
     爬取单个URL的数据
     返回结果字典和状态信息
     """
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger('google_maps_scraper')
+    if max_retries < 1 or max_scrolls < 1 or scroll_wait <= 0:
+        raise ValueError('max_retries、max_scrolls 和 scroll_wait 必须大于 0')
+    url = english_maps_url(url)
     
     # 滚动参数
-    last_height = 0
-    same_count = 0
-    max_no_change = 3
-    max_scrolls = 30
     coordinate_retries = 10
 
-    result = {
+    empty_result = {
         "success": False,
         "error_code": ErrorCodes.SUCCESS,
         "error_message": "",
@@ -134,12 +222,18 @@ def scrape_single_url(url, output_dir="output", headless=True, max_retries=3):
         "reviews_count": 0,
         "reviews": [],
         "csv_file": None,
+        "expected_review_count": None,
+        "reviews_complete": False,
+        "review_stop_reason": "not_started",
         "url": url
     }
 
+    result = empty_result.copy()
     driver = None
     
     for attempt in range(max_retries):
+        # A successful retry must not inherit an earlier attempt's error.
+        result = empty_result.copy()
         try:
             logger.info(f"尝试第 {attempt + 1} 次爬取: {url}")
             
@@ -214,8 +308,10 @@ def scrape_single_url(url, output_dir="output", headless=True, max_retries=3):
                 logger.info("正在提取商户基本信息...")
                 
                 # 商户名称
-                name_elem = safe_find_element(driver, By.CSS_SELECTOR, 'h1.DUwDvf.lfPIob', timeout=15)
-                info['name'] = safe_get_text(name_elem) or "未知商户"
+                name_elem = safe_find_element(driver, By.CSS_SELECTOR, 'h1.DUwDvf.lfPIob', timeout=15, required=True)
+                info['name'] = safe_get_text(name_elem)
+                if not info['name']:
+                    raise ValueError("商户名称为空，无法确认地点页面已加载")
                 
                 # 评分
                 rating_elem = safe_find_element(driver, By.CSS_SELECTOR, 'span.ceNzKf', timeout=10)
@@ -232,110 +328,65 @@ def scrape_single_url(url, output_dir="output", headless=True, max_retries=3):
                 result["error_message"] = f"商户信息提取失败: {str(e)}"
                 logger.warning(result["error_message"])
                 info.update({'name': '未知商户', 'rating': '无评分', 'category': '未知类别'})
+                continue
 
-            # 点击Reviews标签
             all_reviews = []
             try:
-                logger.info("正在查找Reviews按钮...")
-                
-                # 尝试多种方式找到Reviews按钮
-                reviews_selectors = [
-                    "//div[@class='LRkQ2']//div[text()='Reviews']",
-                    "//button[contains(text(), 'Reviews')]",
-                    "//div[contains(text(), 'Reviews')]",
-                    "//span[contains(text(), 'Reviews')]"
-                ]
-                
-                reviews_element = None
-                for selector in reviews_selectors:
-                    elements = driver.find_elements(By.XPATH, selector)
-                    if elements:
-                        reviews_element = elements[0]
-                        break
-                
-                if reviews_element:
-                    driver.execute_script("arguments[0].click();", reviews_element)
-                    time.sleep(3)
-                    logger.info("Reviews按钮点击成功")
-                    
-                    # 查找滚动容器
-                    try:
-                        scrollable_div = safe_find_element(
-                            driver, By.CSS_SELECTOR, 
-                            'div.m6QErb.DxyBCb.kA9KIf.dS8AEf.XiKgde', 
-                            timeout=10, required=True
-                        )
-                        
-                        logger.info("开始滚动加载评论...")
-                        # 滚动加载评论
-                        for scroll_count in range(max_scrolls):
-                            current_height = driver.execute_script("return arguments[0].scrollHeight", scrollable_div)
-                            
-                            if current_height == last_height:
-                                same_count += 1
-                                if same_count >= max_no_change:
-                                    logger.info(f"滚动完成，共滚动 {scroll_count + 1} 次")
-                                    break
-                            else:
-                                same_count = 0
-
-                            driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", scrollable_div)
-                            last_height = current_height
-                            time.sleep(1)
-                        
-                        # 提取评论
-                        logger.info("正在提取评论数据...")
-                        review_elements = driver.find_elements(By.CSS_SELECTOR, 'div.jftiEf.fontBodyMedium')
-                        
-                        for review in review_elements:
-                            try:
-                                # 用户名
-                                username = safe_get_attribute(review, "aria-label", "匿名用户")
-                                
-                                # 内容
-                                content_span = review.find_element(By.CSS_SELECTOR, 'span.wiI7pd')
-                                content = safe_get_text(content_span)
-                                
-                                # 星级
-                                rating_span = review.find_element(By.CSS_SELECTOR, 'span.kvMYJc')
-                                rating = safe_get_attribute(rating_span, 'aria-label', "无评分")
-                                
-                                # 时间
-                                time_element = review.find_element(By.CSS_SELECTOR, 'span.rsqaWe')
-                                time_text = safe_get_text(time_element)
-                                
-                                # 用户附加信息
-                                try:
-                                    info_line = review.find_element(By.CSS_SELECTOR, 'div.RfnDt').text.strip()
-                                except:
-                                    info_line = ""
-
-                                all_reviews.append({
-                                    'user': username,
-                                    'user_info': info_line,
-                                    'rating': rating,
-                                    'time': time_text,
-                                    'content': content,
-                                })
-                            except Exception as e:
-                                logger.warning(f"单条评论提取失败: {str(e)}")
-                                continue
-                                
-                        logger.info(f"成功提取 {len(all_reviews)} 条评论")
-                        
-                    except Exception as e:
-                        result["error_code"] = ErrorCodes.REVIEWS_SCROLL_FAILED
-                        result["error_message"] = f"评论滚动加载失败: {str(e)}"
-                        logger.warning(result["error_message"])
-                        
+                expected = expected_review_count(driver)
+                result["expected_review_count"] = expected
+                if expected == 0:
+                    result.update(reviews_complete=True, review_stop_reason="no_reviews")
                 else:
-                    result["error_code"] = ErrorCodes.REVIEWS_BUTTON_NOT_FOUND
-                    result["error_message"] = "未找到Reviews按钮"
-                    logger.warning(result["error_message"])
-                    
+                    selectors = [
+                        "//button[@role='tab'][contains(@aria-label, 'Reviews')]",
+                        "//div[@class='LRkQ2']//div[text()='Reviews']",
+                        "//button[contains(text(), 'Reviews')]",
+                        "//div[text()='Reviews']",
+                        "//span[text()='Reviews']",
+                    ]
+
+                    def find_reviews_button(browser):
+                        for selector in selectors:
+                            for element in browser.find_elements(By.XPATH, selector):
+                                if element.is_displayed():
+                                    return element
+                        return False
+
+                    try:
+                        reviews_button = WebDriverWait(driver, 10).until(find_reviews_button)
+                    except TimeoutException:
+                        result.update(error_code=ErrorCodes.REVIEWS_BUTTON_NOT_FOUND,
+                                      error_message="未找到 Reviews 按钮，无法确认评论状态",
+                                      review_stop_reason="button_not_found")
+                    else:
+                        driver.execute_script("arguments[0].click();", reviews_button)
+                        try:
+                            container = safe_find_element(
+                                driver, By.CSS_SELECTOR,
+                                'div.m6QErb.DxyBCb.kA9KIf.dS8AEf.XiKgde',
+                                timeout=10, required=True,
+                            )
+                        except TimeoutException:
+                            result.update(error_code=ErrorCodes.REVIEWS_SCROLL_FAILED,
+                                          error_message="未找到评论滚动容器",
+                                          review_stop_reason="scroll_failed")
+                        else:
+                            all_reviews, complete, reason = collect_reviews(
+                                driver, container, expected, max_scrolls, scroll_wait
+                            )
+                            result.update(reviews_complete=complete, review_stop_reason=reason)
+                            if not complete:
+                                code = {
+                                    "scroll_failed": ErrorCodes.REVIEWS_SCROLL_FAILED,
+                                    "extraction_failed": ErrorCodes.REVIEWS_EXTRACTION_FAILED,
+                                }.get(reason, ErrorCodes.REVIEWS_INCOMPLETE)
+                                result.update(error_code=code, error_message=(
+                                    f"评论采集未完成: {reason}; 已采集 {len(all_reviews)}, 页面总数 {expected}"
+                                ))
             except Exception as e:
-                result["error_code"] = ErrorCodes.REVIEWS_EXTRACTION_FAILED
-                result["error_message"] = f"评论提取过程失败: {str(e)}"
+                result.update(error_code=ErrorCodes.REVIEWS_EXTRACTION_FAILED,
+                              error_message=f"评论提取过程失败: {e}",
+                              review_stop_reason="extraction_failed")
                 logger.warning(result["error_message"])
 
             # 提取坐标
@@ -381,11 +432,16 @@ def scrape_single_url(url, output_dir="output", headless=True, max_retries=3):
             
             # 保存数据
             try:
+                os.makedirs(output_dir, exist_ok=True)
+                csv_info = {
+                    ('business_rating' if key == 'rating' else key): value
+                    for key, value in info.items()
+                }
                 if len(all_reviews) == 0:
-                    df = pd.DataFrame([info])
+                    df = pd.DataFrame([csv_info])
                 else:
                     df = pd.DataFrame(all_reviews)
-                    for key, value in info.items():
+                    for key, value in csv_info.items():
                         df[key] = value
                 
                 # 保存CSV文件
@@ -408,7 +464,7 @@ def scrape_single_url(url, output_dir="output", headless=True, max_retries=3):
             final_error_message = result.get("error_message", "")
             
             result.update({
-                "success": True,
+                "success": final_error_code == ErrorCodes.SUCCESS,
                 "error_code": final_error_code,  # 保留原有错误代码
                 "error_message": final_error_message,  # 保留原有错误信息
                 "business_info": info,
@@ -416,7 +472,10 @@ def scrape_single_url(url, output_dir="output", headless=True, max_retries=3):
                 "reviews": all_reviews
             })
             
-            logger.info(f"爬取成功完成: {info['name']}, {len(all_reviews)} 条评论")
+            if (not result['success'] and final_error_code != ErrorCodes.REVIEWS_INCOMPLETE
+                    and attempt < max_retries - 1):
+                continue
+            logger.info(f"爬取结束: {info['name']}, {len(all_reviews)} 条评论, 成功={result['success']}")
             return result
             
         except Exception as e:
@@ -445,15 +504,26 @@ def scrape_single_url(url, output_dir="output", headless=True, max_retries=3):
 
 def main():
     parser = argparse.ArgumentParser(description='Google Maps评论爬虫')
+    parser.add_argument('positional_url', nargs='?', help='Google Maps URL（也可使用 --url）')
     parser.add_argument('--url', type=str, help='要爬取的Google Maps URL')
     parser.add_argument('--urls-file', type=str, default='input/urls.txt', help='包含URL列表的文件路径')
     parser.add_argument('--output-dir', type=str, default='output', help='输出目录')
-    parser.add_argument('--headless', action='store_true', help='无界面模式运行')
+    browser_mode = parser.add_mutually_exclusive_group()
+    browser_mode.add_argument('--headless', dest='headless', action='store_true', help='无界面模式运行')
+    browser_mode.add_argument('--no-headless', dest='headless', action='store_false', help='显示浏览器界面')
+    parser.set_defaults(headless=False)
     parser.add_argument('--json-output', action='store_true', help='以JSON格式输出结果')
     parser.add_argument('--max-retries', type=int, default=3, help='最大重试次数')
+    parser.add_argument('--max-scrolls', type=int, default=30, help='评论滚动次数上限（到达上限可能不完整）')
+    parser.add_argument('--scroll-wait', type=float, default=3, help='每次滚动等待新评论的秒数')
     parser.add_argument('--verbose', action='store_true', help='详细日志输出')
     
     args = parser.parse_args()
+    if args.url and args.positional_url:
+        parser.error('URL 只能通过位置参数或 --url 指定一次')
+    if args.max_retries < 1 or args.max_scrolls < 1 or args.scroll_wait <= 0:
+        parser.error('--max-retries、--max-scrolls 和 --scroll-wait 必须大于 0')
+    args.url = args.url or args.positional_url
     
     # 设置日志级别
     logger = setup_logging()
@@ -500,11 +570,11 @@ def main():
         if not args.json_output:
             print(f"[{i}/{len(urls)}] 正在处理: {url}")
         
-        result = scrape_single_url(url, args.output_dir, args.headless, args.max_retries)
+        result = scrape_single_url(url, args.output_dir, args.headless, args.max_retries,
+                                   max_scrolls=args.max_scrolls, scroll_wait=args.scroll_wait)
+        results.append(result)
         
-        if args.json_output:
-            results.append(result)
-        else:
+        if not args.json_output:
             if result["success"]:
                 business_name = result['business_info'].get('name', '未知')
                 reviews_count = result['reviews_count']
